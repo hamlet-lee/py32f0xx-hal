@@ -13,6 +13,7 @@ use crate::{
 /// I2C abstraction
 pub struct I2c<I2C: Instance, SCLPIN, SDAPIN> {
     i2c: I2C,
+    timeout_threshold: u32,
     pins: (SCLPIN, SDAPIN),
 }
 
@@ -132,6 +133,8 @@ pub enum Error {
     BUS,
     /// Packet error check error
     PEC,
+    /// Timeout
+    TIMEOUT,
 }
 
 // It's s needed for the impls, but rustc doesn't recognize that
@@ -156,7 +159,7 @@ macro_rules! i2c {
 
             impl<SCLPIN, SDAPIN> I2c<$I2C, SCLPIN, SDAPIN> {
                 /// Create an instance of I2C peripheral
-                pub fn $i2c(i2c: $I2C, pins: (SCLPIN, SDAPIN), speed: KiloHertz, clocks: &Clocks) -> Self
+                pub fn $i2c(i2c: $I2C, pins: (SCLPIN, SDAPIN), speed: KiloHertz, clocks: &Clocks, timeout_threshold: u32) -> Self
                 where
                     SCLPIN: SclPin<$I2C>,
                     SDAPIN: SdaPin<$I2C>,
@@ -167,7 +170,7 @@ macro_rules! i2c {
 
                     // Reset I2C
                     $I2C::reset(rcc);
-                    I2c { i2c, pins }.i2c_init(clocks.pclk(), speed)
+                    I2c { i2c, pins, timeout_threshold }.i2c_init(clocks.pclk(), speed)
                 }
             }
         )+
@@ -273,13 +276,11 @@ where
         // It is possible that the STOP condition is still being generated
         // when we reach here, so we wait until it finishes before proceeding
         // to start a new transaction.
-        loop {
+        self.wait_with_timeout(|| {
             self.check_and_clear_error_flags()?;
-            if self.i2c.cr1.read().stop().bit_is_clear() {
-                break;
-            }
-        }
-
+            Ok(self.i2c.cr1.read().stop().bit_is_clear())
+        })?;
+        
         // Clear all pending error bits
         self.i2c.sr1.write(|w| unsafe { w.bits(0) });
 
@@ -302,23 +303,24 @@ where
         }
 
         // Wait until START condition was generated
-        while self.check_and_clear_error_flags()?.sb().bit_is_clear() {}
-
+        self.wait_with_timeout(|| {
+            Ok(self.check_and_clear_error_flags()?.sb().bit_is_set())
+        })?;
+        
         // Also wait until signalled we're master and everything is waiting for us
-        loop {
+        self.wait_with_timeout(|| {
             self.check_and_clear_error_flags()?;
-
             let sr2 = self.i2c.sr2.read();
-            if !(sr2.msl().bit_is_clear() && sr2.busy().bit_is_clear()) {
-                break;
-            }
-        }
+            Ok(!(sr2.msl().bit_is_clear() && sr2.busy().bit_is_clear()))
+        })?;
 
         // Send out address
         self.i2c.dr.write(|w| unsafe { w.bits(wr_addr) });
 
         // Wait until address was sent
-        while self.check_and_clear_error_flags()?.addr().bit_is_clear() {}
+        self.wait_with_timeout(|| {
+            Ok(self.check_and_clear_error_flags()?.addr().bit_is_set())
+        })?;
 
         // Clear condition by reading SR2
         self.i2c.sr2.read();
@@ -329,20 +331,27 @@ where
     fn send_byte(&self, byte: u8) -> Result<(), Error> {
         // Wait until we're ready for sending
         // Check for any I2C errors. If a NACK occurs, the ADDR bit will never be set.
-        while self.check_and_clear_error_flags()?.txe().bit_is_clear() {}
-
+        self.wait_with_timeout(|| {
+            Ok(self.check_and_clear_error_flags()?.txe().bit_is_set())
+        })?;
+        
         // Push out a byte of data
         self.i2c.dr.write(|w| unsafe { w.bits(u32::from(byte)) });
 
         // Wait until byte is transferred
         // Check for any potential error conditions.
-        while self.check_and_clear_error_flags()?.btf().bit_is_clear() {}
+        self.wait_with_timeout(|| {
+            Ok(self.check_and_clear_error_flags()?.btf().bit_is_set())
+        })?;
 
         Ok(())
     }
 
     fn recv_byte(&self) -> Result<u8, Error> {
-        while self.check_and_clear_error_flags()?.rxne().bit_is_clear() {}
+        // Wait until a byte is received
+        self.wait_with_timeout(|| {
+            Ok(self.check_and_clear_error_flags()?.rxne().bit_is_set())
+        })?;
         let value = self.i2c.dr.read().bits() as u8;
         Ok(value)
     }
@@ -371,12 +380,10 @@ where
 
             // Wait for the STOP to be sent. Otherwise, the interface will still be
             // busy for a while after this function returns.
-            loop {
+            self.wait_with_timeout(|| {
                 self.check_and_clear_error_flags()?;
-                if self.i2c.cr1.read().stop().bit_is_clear() {
-                    break;
-                }
-            }
+                Ok(self.i2c.cr1.read().stop().bit_is_clear())
+            })?;
 
             // Fallthrough is success
             Ok(())
@@ -403,10 +410,55 @@ where
 
         // Wait for the STOP to be sent. Otherwise, the interface will still be
         // busy for a while after this function returns.
-        while self.i2c.cr1.read().stop().bit_is_set() {}
+        self.wait_with_timeout(|| {
+            Ok(self.i2c.cr1.read().stop().bit_is_clear())
+        })?;
 
         // Fallthrough is success
         Ok(())
+    }
+
+    /// Generic timeout wait function with loop count limit
+    /// Spins in a loop until the condition is met or max loop times are exhausted
+    /// 
+    /// # Parameters
+    /// - `condition`: Closure that checks the exit condition
+    ///                Returns `Ok(true)`: condition met, exit normally
+    ///                Returns `Ok(false)`: condition not met, continue looping
+    ///                Returns `Err(e)`: hardware error occurred, propagate error immediately
+    /// 
+    /// # Returns
+    /// - `Ok(())`: Condition satisfied within max loop times
+    /// - `Err(Error::I2cTimeout)`: Timeout (max loops exhausted without meeting condition)
+    /// - `Err(_)`: Other hardware errors propagated from the condition closure
+    fn wait_with_timeout<F>(&self, mut condition: F) -> Result<(), Error>
+    where
+        // Closure constraint: no input arguments, returns Result<bool, Error>
+        // FnMut allows the closure to be called repeatedly and capture mutable references
+        F: FnMut() -> Result<bool, Error>,
+    {
+        let mut remaining_loops = self.timeout_threshold; // Remaining loop iterations before timeout
+        loop {
+            // Execute condition check, propagate error immediately if it occurs
+            let is_ok = condition()?;
+
+            // Exit the loop normally if the condition is met
+            if is_ok {
+                return Ok(());
+            }
+
+            // Decrement remaining loops (saturating_sub avoids u32 underflow)
+            remaining_loops = remaining_loops.saturating_sub(1);
+
+            // Return timeout error if no remaining loop iterations
+            if remaining_loops == 0 {
+                return Err(Error::TIMEOUT);
+            }
+
+            // Optional NOP to stabilize loop iteration time
+            // Prevents compiler optimization from making the loop too fast
+            cortex_m::asm::nop();
+        }
     }
 }
 
