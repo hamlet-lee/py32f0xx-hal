@@ -42,6 +42,7 @@
 //! iwdg.feed();
 //! ```
 use embedded_hal_02::watchdog;
+use fugit::Rate;
 
 use crate::pac::IWDG;
 use crate::rcc::Rcc;
@@ -61,31 +62,76 @@ impl watchdog::Watchdog for Watchdog {
 }
 
 /// Timeout configuration for the IWDG
-#[derive(PartialEq, PartialOrd, Clone, Copy)]
+#[derive(PartialEq, PartialOrd, Clone, Copy, Debug)]
 pub struct IwdgTimeout {
     psc: u8,
     reload: u16,
 }
 
-impl From<Hertz> for IwdgTimeout {
-    /// This converts the value so it's usable by the IWDG
-    /// Due to conversion losses, the specified frequency is a maximum
-    ///
-    /// It can also only represent values < 10000 Hertz
-    fn from(hz: Hertz) -> Self {
-        let mut time = 32_768 / 4 / hz.raw();
-        let mut psc = 0;
-        let mut reload = 0;
+// impl From<Hertz> for IwdgTimeout {
+//     /// This converts the value so it's usable by the IWDG
+//     /// Due to conversion losses, the specified frequency is a maximum
+//     ///
+//     /// It can also only represent values <= 32768 Hertz
+//     fn from(hz: Hertz) -> Self {
+//         let mut time = 32_768 / hz.raw();
+//         let mut psc = 0;
+//         let mut reload = 0;
+//         while psc < 7 {
+//             reload = time;
+//             if reload < 0x1000 {
+//                 break;
+//             }
+//             psc += 1;
+//             time /= 2;
+//         }
+//         // As we get an integer value, reload is always below 0xFFF
+//         let reload = (reload - 1).clamp(0, 0xFFF) as u16;
+//         IwdgTimeout { psc, reload }
+//     }
+// }
+
+/// Generic implementation for all fugit Rate variants
+/// Compatible with: Rate<T, NOM, DENOM> (any T/u32/u16, any NOM/DENOM fraction)
+/// Perfectly supports 1/32 Hz (once per 32 seconds) for IWDG timeout config
+impl<const NOM: u32, const DENOM: u32> From<Rate<u32, NOM, DENOM>> for IwdgTimeout
+where
+{
+    /// Converts a fugit Rate to IWDGTimeout config for Independent WatchDog peripheral
+    /// The converted frequency is the theoretical maximum value due to integer division losses
+    /// Hardware hard limit: Only support frequency values ≤ 32768 Hz
+    /// Physical reason: IWDG uses fixed 32768Hz LSI internal oscillator as clock source
+    fn from(rate: Rate<u32, NOM, DENOM>) -> Self {
+        // Fixed IWDG clock source: 32768Hz Low Speed Internal (LSI) oscillator, no prescaling
+        const LSI_CLK: u32 = 32_768;
+        
+        // Convert raw rate value to u32, compatible with all numeric types
+        let raw_rate = rate.raw();
+
+        // Core calculation formula for fractional frequency: Rate = (NOM * raw) / DENOM Hz
+        // Calculate the required counter value without artificial frequency restrictions
+        let mut time = (LSI_CLK * DENOM) / (NOM * raw_rate);
+
+        let mut psc = 0u8;
+        let mut reload = 0u32;
+
+        // Iterate all valid prescaler values (0~7), enable max 256 division (psc=7)
+        // Reduce counter value by half for each prescaler step up
         while psc < 7 {
             reload = time;
-            if reload < 0x1000 {
+            // Exit loop if reload value fits 12-bit hardware limit
+            if reload <= 0xFFF {
                 break;
             }
             psc += 1;
             time /= 2;
         }
-        // As we get an integer value, reload is always below 0xFFF
-        let reload = reload as u16;
+
+        // Critical hardware compensation: -1
+        // IWDG counter counts down from reload to 0, total (reload + 1) clock cycles
+        // Clamp reload in valid 12-bit range [0, 0xFFF] to avoid overflow/underflow
+        let reload = (reload - 1).clamp(0, 0xFFF) as u16;
+
         IwdgTimeout { psc, reload }
     }
 }
@@ -117,6 +163,8 @@ impl watchdog::WatchdogEnable for Watchdog {
         // Wait until it's safe to write to the registers
         while self.iwdg.sr.read().pvu().bit() {}
         self.iwdg.pr.write(|w| w.pr().bits(time.psc));
+        // self.iwdg.pr.write(|w| unsafe { w.bits(time.psc as u32 & 0x07) });
+
         while self.iwdg.sr.read().rvu().bit() {}
         self.iwdg.rlr.write(|w| w.rl().bits(time.reload));
         // Wait until the registers are updated before issuing a reset with

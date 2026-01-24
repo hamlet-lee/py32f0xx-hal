@@ -563,6 +563,12 @@ impl<SPI: Instance, W: Copy> SpiInner<SPI, W> {
         self.spi.sr.read().txe().bit_is_set()
     }
 
+    /// Returns true if the fifo is empty
+    #[inline]
+    pub fn is_transmit_fifo_empty(&self) -> bool {
+        self.spi.sr.read().ftlvl().bits() == 0b00
+    }
+
     /// Returns true if the rx register is not empty (and can be read)
     #[inline]
     pub fn is_rx_not_empty(&self) -> bool {
@@ -696,6 +702,8 @@ impl<SPI: Instance, W: Copy> SpiReadWrite<W> for SpiInner<SPI, W> {
         }
         // Wait for final TXE
         while !self.is_tx_empty() {}
+        // Wait for FIFO empty
+        while !self.is_transmit_fifo_empty() {}
         // Wait for final !BSY
         while self.is_busy() {}
         // Clear OVR set due to dropped received values

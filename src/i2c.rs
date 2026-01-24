@@ -240,13 +240,13 @@ where
         let sr = self.i2c.sr1.read();
         // If we have a set pec error flag, clear it and return an PEC error
         if sr.pecerr().bit_is_set() {
-            self.i2c.sr1.write(|w| w.pecerr().clear_bit());
+            self.i2c.sr1.modify(|_, w| w.pecerr().clear_bit());
             return Err(Error::PEC);
         }
 
         // If we have a set overrun flag, clear it and return an OVERRUN error
         if sr.ovr().bit_is_set() {
-            self.i2c.sr1.write(|w| w.ovr().clear_bit());
+            self.i2c.sr1.modify(|_, w| w.ovr().clear_bit());
             return Err(Error::OVERRUN);
         }
 
@@ -254,13 +254,13 @@ where
         if sr.arlo().bit_is_set() | sr.berr().bit_is_set() {
             self.i2c
                 .sr1
-                .write(|w| w.arlo().clear_bit().berr().clear_bit());
+                .modify(|_, w| w.arlo().clear_bit().berr().clear_bit());
             return Err(Error::BUS);
         }
 
         // If we received a NACK, then signal as a NACK error
         if sr.af().bit_is_set() {
-            self.i2c.sr1.write(|w| w.af().clear_bit());
+            self.i2c.sr1.modify(|_, w| w.af().clear_bit());
             return Err(Error::NACK);
         }
 
